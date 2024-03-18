@@ -15,6 +15,8 @@ else:
     from io import StringIO
 import inspect
 import time
+import atexit
+import cProfile
 import gc
 from collections import defaultdict
 import traceback
@@ -24,9 +26,11 @@ from .chare import CONTRIBUTOR_TYPE_GROUP, CONTRIBUTOR_TYPE_ARRAY
 from .chare import Chare, Mainchare, Group, ArrayMap, Array
 from . import entry_method
 from . import threads
-from .threads import Future, LocalFuture
+from .threads import Future, LocalFuture, LocalMultiFuture
 from . import reduction
 from . import wait
+from charm4py.c_object_store import MessageBuffer
+from . import ray
 import array
 try:
     import numpy
@@ -153,6 +157,18 @@ class Charm(object):
         self.threadMgr = threads.EntryMethodThreadManager(self)
         self.createFuture = self.Future = self.threadMgr.createFuture
 
+        self.send_buffer = MessageBuffer()
+        self.receive_buffer = MessageBuffer()
+        self.future_id = 0
+        # TODO: maybe implement this buffer in c++
+        self.future_get_buffer = {}
+        #print(self.future_mask)
+        self.pr = cProfile.Profile()
+        self.pr.enable()
+
+    def stop_profiling(self):
+        self.pr.dump_stats("prof%i.prof" % self._myPe)
+
     def __init_profiling__(self):
         # these are attributes used only in profiling mode
         # list of Chare types that are registered and used internally by the runtime
@@ -165,6 +181,65 @@ class Charm(object):
         self.runningEntryMethod = None
         # chares created on this PE
         self.activeChares = set()
+
+    
+    def print_dbg(self, *args, **kwargs):
+        print("PE", self.myPe(), ":", *args, **kwargs)
+    
+    @entry_method.coro
+    def get_future_value(self, fut):
+        #self.print_dbg("Getting data for object", fut.id)
+        obj = fut.lookup_object()
+        if obj == None:
+            local_f = LocalFuture()
+            self.future_get_buffer[fut.store_id] = (local_f, fut)
+            fut.request_object()
+            local_f.get()
+            return fut.lookup_object()
+        else:
+            return obj
+        
+    @entry_method.coro
+    def getany_future_value(self, futs, num_returns):
+        ready_count = 0
+        ready_list = []
+        not_local = []
+        for f in futs:
+            if f.is_local():
+                ready_count += 1
+                ready_list.append(f)
+            else:
+                f.request_object()
+                not_local.append(f)
+        if ready_count >= num_returns:
+            return ready_list[:ready_count]
+        else:
+            local_f = LocalMultiFuture(num_returns - ready_count)
+            for f in not_local:
+                self.future_get_buffer[f.store_id] = (local_f, f)
+            result = local_f.get()
+            for f in not_local:
+                self.future_get_buffer.pop(f.store_id, None)
+            return ready_list + result
+        
+    def check_futures_buffer(self, obj_id):
+        if obj_id in self.future_get_buffer:
+            local_f, fut = self.future_get_buffer.pop(obj_id)
+            local_f.send(fut)
+
+    def check_send_buffer(self, obj_id):
+        completed = self.send_buffer.check(obj_id)
+
+    def check_receive_buffer(self, obj_id):
+        #print("Received result for", obj_id, "on pe", self._myPe)
+        completed = self.receive_buffer.check(obj_id)
+        for args in completed:
+            args = list(args)
+            for i, arg in enumerate(args[-1][:-1]):
+                if isinstance(arg, Future):
+                    dep_obj = arg.lookup_object()
+                    args[-1][i] = dep_obj
+            self.invokeEntryMethod(*args, ret_fut=True)
 
     def handleGeneralError(self):
         errorType, error, stacktrace = sys.exc_info()
@@ -248,12 +323,12 @@ class Charm(object):
             self.lib.CkRegisterReadonly(b'charm4py_ro', b'charm4py_ro', msg)
         gc.collect()
 
-    def invokeEntryMethod(self, obj, ep, header, args):
+    def invokeEntryMethod(self, obj, ep, header, args, ret_fut=False):
         em = self.entryMethods[ep]
         if (em.when_cond is not None) and (not em.when_cond.evaluateWhen(obj, args)):
             obj.__waitEnqueue__(em.when_cond, (0, em, header, args))
         else:
-            em.run(obj, header, args)
+            em.run(obj, header, args, ret_fut=ret_fut)
             if self.options.auto_flush_wait_queues and obj._cond_next is not None:
                 obj.__flush_wait_queues__()
 
@@ -266,7 +341,19 @@ class Charm(object):
         if gid in self.groups:
             obj = self.groups[gid]
             header, args = self.unpackMsg(msg, dcopy_start, obj)
-            self.invokeEntryMethod(obj, ep, header, args)
+            #dep_ids = []
+            #for i, arg in enumerate(args[:-1]):
+            #    if isinstance(arg, Future):
+            #        dep_obj = arg.lookup_object()
+            #        if dep_obj != None:
+            #            args[i] = dep_obj
+            #        else:
+            #            dep_ids.append(arg.store_id)
+            #            arg.request_object()
+            #if len(dep_ids) > 0:
+            #    charm.receive_buffer.insert(dep_ids, (obj, ep, header, args))
+            #else:
+            self.invokeEntryMethod(obj, ep, header, args, ret_fut=False)        
         else:
             em = self.entryMethods[ep]
             header, args = self.unpackMsg(msg, dcopy_start, None)
@@ -297,7 +384,20 @@ class Charm(object):
         if index in self.arrays[aid]:
             obj = self.arrays[aid][index]
             header, args = self.unpackMsg(msg, dcopy_start, obj)
-            self.invokeEntryMethod(obj, ep, header, args)
+            dep_ids = []
+            if ray.api.ray_initialized:
+                for i, arg in enumerate(args[:-1]):
+                    if isinstance(arg, Future):
+                        dep_obj = arg.lookup_object()
+                        if dep_obj != None:
+                            args[i] = dep_obj
+                        else:
+                            dep_ids.append(arg.store_id)
+                            arg.request_object()
+            if len(dep_ids) > 0:
+                charm.receive_buffer.insert(dep_ids, (obj, ep, header, args))
+            else:
+                self.invokeEntryMethod(obj, ep, header, args, ret_fut=ray.api.ray_initialized)
         else:
             em = self.entryMethods[ep]
             assert em.name == '__init__', 'Specified array entry method not constructor'
@@ -1028,6 +1128,10 @@ class CharmRemote(Chare):
 
     def __init__(self):
         charm.thisProxy = self.thisProxy
+
+    def stop_profiling(self):
+        charm.stop_profiling()
+        self.exit()
 
     def exit(self, exit_code=0):
         charm.exit(exit_code)
